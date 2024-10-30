@@ -17,10 +17,7 @@ namespace v8 {
 namespace internal {
 namespace compiler {
 
-#define TRACE_UNIMPL() \
-  PrintF("UNIMPLEMENTED instr_sel: %s at line %d\n", __FUNCTION__, __LINE__)
-
-#define TRACE() PrintF("instr_sel: %s at line %d\n", __FUNCTION__, __LINE__)
+#define TRACE(...) PrintF(__VA_ARGS__)
 
 // Adds Mips-specific methods for generating InstructionOperands.
 template <typename Adapter>
@@ -140,7 +137,7 @@ class Mips64OperandGeneratorT final : public OperandGeneratorT<Adapter> {
 
  private:
   bool ImmediateFitsAddrMode1Instruction(int32_t imm) const {
-    TRACE_UNIMPL();
+    TRACE("UNIMPLEMENTED instr_sel: %s at line %d\n", __FUNCTION__, __LINE__);
     return false;
   }
 };
@@ -515,12 +512,9 @@ void InstructionSelectorT<Adapter>::VisitStackSlot(node_t node) {
 
 template <typename Adapter>
 void InstructionSelectorT<Adapter>::VisitAbortCSADcheck(node_t node) {
-  if constexpr (Adapter::IsTurboshaft) {
-    UNIMPLEMENTED();
-  } else {
-    Mips64OperandGeneratorT<Adapter> g(this);
-    Emit(kArchAbortCSADcheck, g.NoOutput(), g.UseFixed(node->InputAt(0), a0));
-  }
+  Mips64OperandGeneratorT<Adapter> g(this);
+  Emit(kArchAbortCSADcheck, g.NoOutput(),
+       g.UseFixed(this->input_at(node, 0), a0));
 }
 
 template <typename Adapter>
@@ -2256,12 +2250,11 @@ void InstructionSelectorT<TurboshaftAdapter>::VisitTruncateInt64ToInt32(
   auto value = input_at(node, 0);
   if (CanCover(node, value)) {
     if (Get(value).Is<Opmask::kWord64ShiftRightArithmetic>()) {
+      auto shift_value = input_at(value, 1);
       if (CanCover(value, input_at(value, 0)) &&
           TryEmitExtendingLoad(this, value, node)) {
         return;
-      } else {
-        auto shift_value = input_at(value, 1);
-        DCHECK(g.IsIntegerConstant(shift_value));
+      } else if (g.IsIntegerConstant(shift_value)) {
         auto constant = g.GetIntegerConstantValue(constant_view(shift_value));
 
         if (constant >= 32 && constant <= 63) {
@@ -2274,7 +2267,7 @@ void InstructionSelectorT<TurboshaftAdapter>::VisitTruncateInt64ToInt32(
       }
     }
   }
-  Emit(kMips64Shl, g.DefineAsRegister(node), g.UseRegister(input_at(node, 0)),
+  Emit(kMips64Shl, g.DefineAsRegister(node), g.UseRegister(value),
        g.TempImmediate(0));
 }
 
@@ -2867,24 +2860,6 @@ void VisitWordCompare(InstructionSelectorT<Adapter>* selector,
   }
 }
 
-bool IsNodeUnsigned(Node* n) {
-  NodeMatcher m(n);
-
-  if (m.IsLoad() || m.IsUnalignedLoad() || m.IsProtectedLoad()) {
-    LoadRepresentation load_rep = LoadRepresentationOf(n->op());
-    return load_rep.IsUnsigned();
-  } else if (m.IsWord32AtomicLoad() || m.IsWord64AtomicLoad()) {
-    AtomicLoadParameters atomic_load_params = AtomicLoadParametersOf(n->op());
-    LoadRepresentation load_rep = atomic_load_params.representation();
-    return load_rep.IsUnsigned();
-  } else {
-    return m.IsUint32Div() || m.IsUint32LessThan() ||
-           m.IsUint32LessThanOrEqual() || m.IsUint32Mod() ||
-           m.IsUint32MulHigh() || m.IsChangeFloat64ToUint32() ||
-           m.IsTruncateFloat64ToUint32() || m.IsTruncateFloat32ToUint32();
-  }
-}
-
 // Shared routine for multiple word compare operations.
 template <typename Adapter>
 void VisitFullWord32Compare(InstructionSelectorT<Adapter>* selector,
@@ -2907,7 +2882,8 @@ void VisitFullWord32Compare(InstructionSelectorT<Adapter>* selector,
 
 template <typename Adapter>
 void VisitOptimizedWord32Compare(InstructionSelectorT<Adapter>* selector,
-                                 Node* node, InstructionCode opcode,
+                                 typename Adapter::node_t node,
+                                 InstructionCode opcode,
                                  FlagsContinuationT<Adapter>* cont) {
   if (v8_flags.debug_code) {
     Mips64OperandGeneratorT<Adapter> g(selector);
@@ -2919,13 +2895,15 @@ void VisitOptimizedWord32Compare(InstructionSelectorT<Adapter>* selector,
     InstructionCode testOpcode = opcode |
                                  FlagsConditionField::encode(condition) |
                                  FlagsModeField::encode(kFlags_set);
+    auto lhs = selector->input_at(node, 0);
+    auto rhs = selector->input_at(node, 1);
 
-    selector->Emit(testOpcode, optimizedResult, g.UseRegister(node->InputAt(0)),
-                   g.UseRegister(node->InputAt(1)));
+    selector->Emit(testOpcode, optimizedResult, g.UseRegister(lhs),
+                   g.UseRegister(rhs));
 
-    selector->Emit(kMips64Dshl, leftOp, g.UseRegister(node->InputAt(0)),
+    selector->Emit(kMips64Dshl, leftOp, g.UseRegister(lhs),
                    g.TempImmediate(32));
-    selector->Emit(kMips64Dshl, rightOp, g.UseRegister(node->InputAt(1)),
+    selector->Emit(kMips64Dshl, rightOp, g.UseRegister(rhs),
                    g.TempImmediate(32));
     selector->Emit(testOpcode, fullResult, leftOp, rightOp);
 
@@ -2942,37 +2920,32 @@ template <typename Adapter>
 void VisitWord32Compare(InstructionSelectorT<Adapter>* selector,
                         typename Adapter::node_t node,
                         FlagsContinuationT<Adapter>* cont) {
+  // MIPS64 doesn't support Word32 compare instructions. Instead it relies
+  // that the values in registers are correctly sign-extended and uses
+  // Word64 comparison.
+
+  // When calling a host function in the simulator, if the function returns an
+  // int32 value, the simulator does not sign-extend it to int64 because in
+  // the simulator we do not know whether the function returns an int32 or
+  // an int64. So we need to do a full word32 compare in this case.
+#ifdef USE_SIMULATOR
   if constexpr (Adapter::IsTurboshaft) {
-    VisitFullWord32Compare(selector, node, kMips64Cmp, cont);
-  } else {
-    // MIPS64 doesn't support Word32 compare instructions. Instead it relies
-    // that the values in registers are correctly sign-extended and uses
-    // Word64 comparison instead. This behavior is correct in most cases,
-    // but doesn't work when comparing signed with unsigned operands.
-    // We could simulate full Word32 compare in all cases but this would
-    // create an unnecessary overhead since unsigned integers are rarely
-    // used in JavaScript.
-    // The solution proposed here tries to match a comparison of signed
-    // with unsigned operand, and perform full Word32Compare only
-    // in those cases. Unfortunately, the solution is not complete because
-    // it might skip cases where Word32 full compare is needed, so
-    // basically it is a hack.
-    // When call to a host function in simulator, if the function return a
-    // int32 value, the simulator do not sign-extended to int64 because in
-    // simulator we do not know the function whether return a int32 or int64.
-    // so we need do a full word32 compare in this case.
-#ifndef USE_SIMULATOR
-    if (IsNodeUnsigned(node->InputAt(0)) != IsNodeUnsigned(node->InputAt(1))) {
-#else
-    if (IsNodeUnsigned(node->InputAt(0)) != IsNodeUnsigned(node->InputAt(1)) ||
-        node->InputAt(0)->opcode() == IrOpcode::kCall ||
-        node->InputAt(1)->opcode() == IrOpcode::kCall ) {
-#endif
+    using namespace turboshaft;  // NOLINT(build/namespaces)
+    const Operation& lhs = selector->Get(selector->input_at(node, 0));
+    const Operation& rhs = selector->Get(selector->input_at(node, 1));
+    if (lhs.Is<DidntThrowOp>() || rhs.Is<DidntThrowOp>()) {
       VisitFullWord32Compare(selector, node, kMips64Cmp, cont);
-    } else {
-      VisitOptimizedWord32Compare(selector, node, kMips64Cmp, cont);
+      return;
+    }
+  } else {
+    if (node->InputAt(0)->opcode() == IrOpcode::kCall ||
+        node->InputAt(1)->opcode() == IrOpcode::kCall) {
+      VisitFullWord32Compare(selector, node, kMips64Cmp, cont);
+      return;
     }
   }
+#endif
+  VisitOptimizedWord32Compare(selector, node, kMips64Cmp, cont);
 }
 
 template <typename Adapter>
@@ -3842,12 +3815,8 @@ void InstructionSelectorT<Adapter>::VisitFloat64InsertHighWord32(node_t node) {
 
 template <typename Adapter>
 void InstructionSelectorT<Adapter>::VisitMemoryBarrier(node_t node) {
-  if constexpr (Adapter::IsTurboshaft) {
-    UNIMPLEMENTED();
-  } else {
-    Mips64OperandGeneratorT<Adapter> g(this);
-    Emit(kMips64Sync, g.NoOutput());
-  }
+  Mips64OperandGeneratorT<Adapter> g(this);
+  Emit(kMips64Sync, g.NoOutput());
 }
 
 template <typename Adapter>
@@ -4806,7 +4775,6 @@ template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)
 #undef SIMD_RELAXED_OP_LIST
 #undef SIMD_UNOP_LIST
 #undef SIMD_TYPE_LIST
-#undef TRACE_UNIMPL
 #undef TRACE
 
 }  // namespace compiler
